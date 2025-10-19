@@ -1,19 +1,20 @@
-name: Domain Test scan
+name: domain  Scanner
 
 on:
   workflow_dispatch:
     inputs:
       domain:
-        description: 'Domain to scan (e.g. example.com)'
+        description: 'Domain to scan manually'
         required: true
         default: 'example.com'
+  schedule:
+    - cron: '0 6 * * 1'  # Every Monday at 6 AM UTC
 
 jobs:
-  quick-scan:
+  scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Setup Go
@@ -21,77 +22,113 @@ jobs:
         with:
           go-version: '1.21'
 
-      - name: Install minimal tools
+      - name: Install Tools
         run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y jq unzip wget git build-essential ca-certificates
-          echo "GOBIN=$HOME/go/bin" >> $GITHUB_ENV
-          echo "PATH=$PATH:$HOME/go/bin" >> $GITHUB_ENV
-          export GOBIN=$HOME/go/bin
-          export PATH=$PATH:$HOME/go/bin
+          # Install subfinder
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          
+          # Install nuclei
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          
+          # Install assetfinder
+          go install -v github.com/tomnomnom/assetfinder@latest
+          
+          # Install jq for JSON processing
+          sudo apt-get update && sudo apt-get install -y jq
 
-          # install tools (ignore non-fatal failures)
-          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest || true
-          go install -v github.com/tomnomnom/assetfinder@latest || true
-          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest || true
-          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest || true
-
-          echo "Installed (or attempted): subfinder, assetfinder, httpx, nuclei"
-          which subfinder || true
-          which assetfinder || true
-          which httpx || true
-          which nuclei || true
-
-      - name: Set domain env
+      - name: Validate Secrets
         run: |
-          echo "DOMAIN=${{ github.event.inputs.domain }}" >> $GITHUB_ENV
-
-      - name: Quick discovery (subfinder + assetfinder)
-        run: |
-          subfinder -d "${DOMAIN}" -silent -o subfinder-subs.txt || true
-          assetfinder -subs-only "${DOMAIN}" > assetfinder-subs.txt || true
-          cat subfinder-subs.txt assetfinder-subs.txt | sort -u > subdomains.raw.txt || true
-          wc -l subdomains.raw.txt || true
-
-      - name: Filter alive with httpx
-        run: |
-          # httpx will check which hosts respond (http/https). output alive.txt
-          cat subdomains.raw.txt | httpx -silent -status-code -title -o alive.txt || true
-          # Keep only hostnames (httpx outputs full URL; extract host)
-          awk '{print $1}' alive.txt | sed -E 's#^https?://##; s#/.*$##' | sort -u > alive-hosts.txt || true
-          echo "Alive hosts count: $(wc -l < alive-hosts.txt || echo 0)"
-
-      - name: Run nuclei on alive hosts
-        run: |
-          if [ -s alive-hosts.txt ]; then
-            nuclei -l alive-hosts.txt -severity critical,high,medium -silent -o nuclei-results.txt || true
-          else
-            echo "No alive hosts to scan" > nuclei-results.txt
+          if [ -z "${{ secrets.DISCORD_WEBHOOK }}" ]; then
+            echo "::error::DISCORD_WEBHOOK secret is not set"
+            exit 1
           fi
-          echo "NUCLEI_VULNS_FOUND=$(wc -l < nuclei-results.txt)" >> $GITHUB_ENV
-          echo "Nuclei found: $(wc -l < nuclei-results.txt || echo 0)"
+          echo "DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK }}" >> $GITHUB_ENV
 
-      - name: Output quick summary
+      - name: Set Domain
+        id: set_domain
         run: |
-          echo "=== Quick Scan Summary ==="
-          echo "Domain: ${DOMAIN}"
-          echo "Raw subdomains: $(wc -l < subdomains.raw.txt || echo 0)"
-          echo "Alive hosts: $(wc -l < alive-hosts.txt || echo 0)"
-          echo "Nuclei findings: $(wc -l < nuclei-results.txt || echo 0)"
-          echo "---- sample alive hosts ----"
-          head -n 20 alive-hosts.txt || true
-          echo "---- sample nuclei results ----"
-          head -n 20 nuclei-results.txt || true
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "DOMAIN=${{ github.event.inputs.domain }}" >> $GITHUB_ENV
+          else
+            echo "DOMAIN=example.com" >> $GITHUB_ENV
+          fi
 
-      - name: Upload artifacts
+      - name: Notify Start
+        run: |
+          curl -X POST -H "Content-Type: application/json" -d '{
+            "content": "🔍 **Scan Started**\n**Domain:** ${{ env.DOMAIN }}\n**Trigger:** ${{ github.event_name }}\n**Tools:** Subfinder + Assetfinder + Nuclei"
+          }' "${{ env.DISCORD_WEBHOOK }}"
+
+      - name: Run Subfinder
+        run: |
+          subfinder -d ${{ env.DOMAIN }} -silent -o subfinder-subs.txt
+          echo "SUBFINDER_SUBS_FOUND=$(wc -l < subfinder-subs.txt)" >> $GITHUB_ENV
+
+      - name: Run Assetfinder
+        run: |
+          assetfinder -subs-only ${{ env.DOMAIN }} > assetfinder-subs.txt
+          echo "ASSETFINDER_SUBS_FOUND=$(wc -l < assetfinder-subs.txt)" >> $GITHUB_ENV
+
+      - name: Combine All Subdomains
+        run: |
+          cat subfinder-subs.txt assetfinder-subs.txt | sort -u > subdomains.txt
+          echo "TOTAL_SUBDOMAINS_FOUND=$(wc -l < subdomains.txt)" >> $GITHUB_ENV
+
+      - name: Notify Subdomain Results
+        run: |
+          SUBDOMAINS_CONTENT=$(cat subdomains.txt)
+          MESSAGE="✅ **Subdomain Discovery Complete**\n**Domain:** ${{ env.DOMAIN }}\n**Subfinder:** ${{ env.SUBFINDER_SUBS_FOUND }}\n**Assetfinder:** ${{ env.ASSETFINDER_SUBS_FOUND }}\n**Total:** ${{ env.TOTAL_SUBDOMAINS_FOUND }}\n\n\`\`\`\n$SUBDOMAINS_CONTENT\n\`\`\`"
+          
+          if [ ${#MESSAGE} -gt 1900 ]; then
+            TRUNCATED=$(echo "$SUBDOMAINS_CONTENT" | head -c 1800)
+            MESSAGE="✅ **Subdomain Discovery Complete**\n**Domain:** ${{ env.DOMAIN }}\n**Subfinder:** ${{ env.SUBFINDER_SUBS_FOUND }}\n**Assetfinder:** ${{ env.ASSETFINDER_SUBS_FOUND }}\n**Total:** ${{ env.TOTAL_SUBDOMAINS_FOUND }}\n\n\`\`\`\n$TRUNCATED... [truncated]\n\`\`\`"
+          fi
+          
+          curl -X POST -H "Content-Type: application/json" \
+            -d "{\"content\": $(echo "$MESSAGE" | jq -Rs .)}" \
+            "${{ env.DISCORD_WEBHOOK }}"
+
+      - name: Run Nuclei
+        run: |
+          nuclei -l subdomains.txt -severity critical,high,medium -silent -o nuclei-results.txt
+          echo "NUCLEI_VULNS_FOUND=$(wc -l < nuclei-results.txt)" >> $GITHUB_ENV
+
+      - name: Notify Vulnerability Summary
+        run: |
+          if [ ${{ env.NUCLEI_VULNS_FOUND }} -gt 0 ]; then
+            curl -X POST -H "Content-Type: application/json" -d "{
+              \"content\": \"🚨 **Vulnerabilities Found!**\n**Domain:** ${{ env.DOMAIN }}\n**Nuclei Vulnerabilities:** ${{ env.NUCLEI_VULNS_FOUND }}\"
+            }" "${{ env.DISCORD_WEBHOOK }}"
+          else
+            curl -X POST -H "Content-Type: application/json" -d '{
+              "content": "✅ **Scan Complete**\n**Domain:** ${{ env.DOMAIN }}\nNo critical/high/medium vulnerabilities found"
+            }' "${{ env.DISCORD_WEBHOOK }}"
+          fi
+
+      - name: Send Nuclei Vulnerabilities
+        if: env.NUCLEI_VULNS_FOUND > 0
+        run: |
+          while IFS= read -r vuln; do
+            VULN_NAME=$(echo "$vuln" | grep -oP '\[\K[^\]]+' | head -1)
+            SEVERITY=$(echo "$vuln" | grep -oP '\]\[\K[^\]]+' | head -1)
+            URL=$(echo "$vuln" | grep -oP 'http[^\s]+' | head -1)
+            [ -z "$VULN_NAME" ] && VULN_NAME="Unknown"
+            [ -z "$SEVERITY" ] && SEVERITY="Unknown"
+            
+            MESSAGE="🚨 **Nuclei Vulnerability Found**\n**Domain:** ${{ env.DOMAIN }}\n**URL:** $URL\n**Vulnerability:** $VULN_NAME\n**Severity:** $SEVERITY\n\`\`\`\n$vuln\n\`\`\`"
+            
+            curl -X POST -H "Content-Type: application/json" \
+              -d "{\"content\": $(echo "$MESSAGE" | jq -Rs .)}" \
+              "${{ env.DISCORD_WEBHOOK }}"
+            sleep 1
+          done < nuclei-results.txt
+
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: quick-scan-results-${{ github.event.inputs.domain }}
+          name: scan-results
           path: |
             subfinder-subs.txt
             assetfinder-subs.txt
-            subdomains.raw.txt
-            alive.txt
-            alive-hosts.txt
+            subdomains.txt
             nuclei-results.txt
