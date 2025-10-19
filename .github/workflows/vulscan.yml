@@ -24,23 +24,37 @@ jobs:
 
       - name: Install Tools
         run: |
-          # Install subfinder
+          set -e
+
+          # update & base packages
+          sudo apt-get update
+          sudo apt-get install -y jq unzip wget git build-essential ca-certificates
+
+          # ensure Go bin in PATH (actions/setup-go must run before this)
+          echo "PATH=$PATH:$HOME/go/bin" >> $GITHUB_ENV
+          export PATH=$PATH:$HOME/go/bin
+
+          # Install via go (will put binaries in $HOME/go/bin)
           go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          
-          # Install nuclei
           go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-          
-          # Install assetfinder
           go install -v github.com/tomnomnom/assetfinder@latest
-          
-          # Install amass
-          sudo apt-get update && sudo apt-get install -y amass
-          
-          # Install subzy
-          go install -v github.com/lukasikic/subzy@latest
-          
-          # Install jq for JSON processing
-          sudo apt-get update && sudo apt-get install -y jq
+          # Subzy: use maintained fork (works with `go install`)
+          go install -v github.com/PentestPad/subzy@latest
+
+          # Install Amass (binary release)
+          wget -q https://github.com/OWASP/Amass/releases/latest/download/amass_linux_amd64.zip
+          unzip -q amass_linux_amd64.zip
+          sudo mv amass_linux_amd64/amass /usr/local/bin/
+          sudo chmod +x /usr/local/bin/amass
+          rm -rf amass_linux_amd64* amass_linux_amd64.zip
+
+          # small verification (non-failing if a tool absent)
+          echo "---- installed tools (versions / help snippets) ----"
+          subfinder -version || subfinder -h | head -n 1 || true
+          nuclei -version || nuclei -h | head -n 1 || true
+          assetfinder -h | head -n 1 || true
+          subzy -h | head -n 1 || true
+          amass -version || true
 
       - name: Validate Secrets
         run: |
