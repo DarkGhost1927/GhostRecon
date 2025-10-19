@@ -4,17 +4,22 @@ name: ghost domain scanner v01
 
 on:
   # Schedule the workflow to run every 3 days at midnight UTC.
-  # Cron syntax: minute hour day-of-month month day-of-week
+  # It will use the default domain specified in the `workflow_dispatch` inputs.
   schedule:
     - cron: '0 0 */3 * *'
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      target_domain:
+        description: 'The target domain to scan (e.g., https://mydomain.com)'
+        required: true
+        default: 'https://example.com'
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     permissions:
-      contents: read # This is needed for the checkout action
+      contents: read
 
     steps:
       - name: Checkout repository
@@ -23,16 +28,15 @@ jobs:
       - name: Setup Nuclei
         uses: projectdiscovery/nuclei-action@main
         with:
-          # This will automatically update the vulnerability templates
           nuclei-version: 'latest'
 
       - name: Run Nuclei Scan
         id: nuclei-scan
         run: |
-          # =================================================================
-          # !!! IMPORTANT: CHANGE "example.com" TO YOUR TARGET DOMAIN !!!
-          # =================================================================
-          nuclei -u https://example.com -json -o results.json -silent
+          # The domain is now taken from the workflow input.
+          # For scheduled runs, it uses the 'default' value.
+          # For manual runs, it uses the value you provide.
+          nuclei -u "${{ github.event.inputs.target_domain }}" -json -o results.json -silent
         shell: bash
 
       - name: Process Report and Notify Discord
@@ -44,8 +48,8 @@ jobs:
             # Count the number of vulnerabilities
             VULN_COUNT=$(wc -l < results.json)
             
-            # Start building the Discord message
-            FINAL_MESSAGE="**🚨 Ghost Domain Scanner Report for example.com**\nFound **${VULN_COUNT}** vulnerabilities:\n"
+            # Start building the Discord message using the dynamic domain
+            FINAL_MESSAGE="**🚨 Ghost Domain Scanner Report for ${{ github.event.inputs.target_domain }}**\nFound **${VULN_COUNT}** vulnerabilities:\n"
             
             # Loop through each line in the JSON results file
             while IFS= read -r line; do
@@ -60,7 +64,8 @@ jobs:
             
           else
             echo "No vulnerabilities found."
-            FINAL_MESSAGE="**✅ Ghost Domain Scanner Report for example.com**\nNo vulnerabilities found."
+            # Build the success message using the dynamic domain
+            FINAL_MESSAGE="**✅ Ghost Domain Scanner Report for ${{ github.event.inputs.target_domain }}**\nNo vulnerabilities found."
           fi
           
           # Construct the JSON payload for Discord using jq for safety
