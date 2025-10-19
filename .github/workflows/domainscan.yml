@@ -1,0 +1,97 @@
+name: Domain Test scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Domain to scan (e.g. example.com)'
+        required: true
+        default: 'example.com'
+
+jobs:
+  quick-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Install minimal tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq unzip wget git build-essential ca-certificates
+          echo "GOBIN=$HOME/go/bin" >> $GITHUB_ENV
+          echo "PATH=$PATH:$HOME/go/bin" >> $GITHUB_ENV
+          export GOBIN=$HOME/go/bin
+          export PATH=$PATH:$HOME/go/bin
+
+          # install tools (ignore non-fatal failures)
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest || true
+          go install -v github.com/tomnomnom/assetfinder@latest || true
+          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest || true
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest || true
+
+          echo "Installed (or attempted): subfinder, assetfinder, httpx, nuclei"
+          which subfinder || true
+          which assetfinder || true
+          which httpx || true
+          which nuclei || true
+
+      - name: Set domain env
+        run: |
+          echo "DOMAIN=${{ github.event.inputs.domain }}" >> $GITHUB_ENV
+
+      - name: Quick discovery (subfinder + assetfinder)
+        run: |
+          subfinder -d "${DOMAIN}" -silent -o subfinder-subs.txt || true
+          assetfinder -subs-only "${DOMAIN}" > assetfinder-subs.txt || true
+          cat subfinder-subs.txt assetfinder-subs.txt | sort -u > subdomains.raw.txt || true
+          wc -l subdomains.raw.txt || true
+
+      - name: Filter alive with httpx
+        run: |
+          # httpx will check which hosts respond (http/https). output alive.txt
+          cat subdomains.raw.txt | httpx -silent -status-code -title -o alive.txt || true
+          # Keep only hostnames (httpx outputs full URL; extract host)
+          awk '{print $1}' alive.txt | sed -E 's#^https?://##; s#/.*$##' | sort -u > alive-hosts.txt || true
+          echo "Alive hosts count: $(wc -l < alive-hosts.txt || echo 0)"
+
+      - name: Run nuclei on alive hosts
+        run: |
+          if [ -s alive-hosts.txt ]; then
+            nuclei -l alive-hosts.txt -severity critical,high,medium -silent -o nuclei-results.txt || true
+          else
+            echo "No alive hosts to scan" > nuclei-results.txt
+          fi
+          echo "NUCLEI_VULNS_FOUND=$(wc -l < nuclei-results.txt)" >> $GITHUB_ENV
+          echo "Nuclei found: $(wc -l < nuclei-results.txt || echo 0)"
+
+      - name: Output quick summary
+        run: |
+          echo "=== Quick Scan Summary ==="
+          echo "Domain: ${DOMAIN}"
+          echo "Raw subdomains: $(wc -l < subdomains.raw.txt || echo 0)"
+          echo "Alive hosts: $(wc -l < alive-hosts.txt || echo 0)"
+          echo "Nuclei findings: $(wc -l < nuclei-results.txt || echo 0)"
+          echo "---- sample alive hosts ----"
+          head -n 20 alive-hosts.txt || true
+          echo "---- sample nuclei results ----"
+          head -n 20 nuclei-results.txt || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: quick-scan-results-${{ github.event.inputs.domain }}
+          path: |
+            subfinder-subs.txt
+            assetfinder-subs.txt
+            subdomains.raw.txt
+            alive.txt
+            alive-hosts.txt
+            nuclei-results.txt
