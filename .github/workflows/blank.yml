@@ -1,0 +1,154 @@
+name: Ghost Scanner v01
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Domain to scan'
+        required: true
+        default: 'example.com'
+  schedule:
+    # Runs every 3 days at 6 AM UTC
+    - cron: '0 6 */3 * *'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Install Tools
+        run: |
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install -v github.com/tomnomnom/assetfinder@latest
+          go install -v github.com/LukaSikic/subzy@latest
+          sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Validate Secrets
+        run: |
+          if [ -z "${{ secrets.DISCORD_WEBHOOK }}" ]; then
+            echo "::error::DISCORD_WEBHOOK secret is not set"
+            exit 1
+          fi
+          if [ -z "${{ secrets.SECURITYTRAILS_API_KEY }}" ]; then
+            echo "::warning::SECURITYTRAILS_API_KEY secret is not set. Skipping SecurityTrails."
+          fi
+          echo "DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK }}" >> $GITHUB_ENV
+
+      - name: Set Domain
+        id: set_domain
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "DOMAIN=${{ github.event.inputs.domain }}" >> $GITHUB_ENV
+          else
+            echo "DOMAIN=example.com" >> $GITHUB_ENV
+          fi
+
+      - name: Notify Start
+        run: |
+          curl -X POST -H "Content-Type: application/json" -d '{
+            "content": "🔍 **Enhanced Scan Started**\n**Domain:** ${{ env.DOMAIN }}\n**Trigger:** ${{ github.event_name }}\n**Tools:** Assetfinder, Subfinder, SecurityTrails, C99, Nuclei, Subzy"
+          }' "${{ env.DISCORD_WEBHOOK }}"
+
+      - name: Run Subdomain Enumeration
+        run: |
+          # Create a directory for all tool outputs
+          mkdir -p enum_results
+          
+          # 1. Assetfinder
+          echo "[*] Running Assetfinder..."
+          assetfinder --subs-only ${{ env.DOMAIN }} > enum_results/assetfinder.txt
+          
+          # 2. Subfinder
+          echo "[*] Running Subfinder..."
+          subfinder -d ${{ env.DOMAIN }} -silent -o enum_results/subfinder.txt
+          
+          # 3. SecurityTrails
+          if [ -n "${{ secrets.SECURITYTRAILS_API_KEY }}" ]; then
+            echo "[*] Running SecurityTrails..."
+            curl -s "https://api.securitytrails.com/v1/domain/${{ env.DOMAIN }}/subdomains?apikey=${{ secrets.SECURITYTRAILS_API_KEY }}" | jq -r '.subdomains[]' | sed "s/$/.${{ env.DOMAIN }}/" > enum_results/securitytrails.txt
+          else
+            touch enum_results/securitytrails.txt
+          fi
+          
+          # 4. C99.nl (scraping method)
+          echo "[*] Running C99.nl..."
+          curl -s "https://subdomainfinder.c99.nl/scanner/${{ env.DOMAIN }}" | grep -oE '[a-zA-Z0-9.-]+\.${{ env.DOMAIN }}' | sort -u > enum_results/c99.txt
+          
+          # Combine all results, sort, and remove duplicates
+          cat enum_results/*.txt | sort -u > subdomains.txt
+          echo "SUBDOMAINS_FOUND=$(wc -l < subdomains.txt)" >> $GITHUB_ENV
+          echo "[+] Total unique subdomains found: ${{ env.SUBDOMAINS_FOUND }}"
+
+      - name: Notify Subdomain Enumeration Results
+        run: |
+          SUBDOMAINS_CONTENT=$(cat subdomains.txt)
+          MESSAGE="✅ **Subdomain Enumeration Complete**\n**Domain:** ${{ env.DOMAIN }}\n**Subdomains Found:** ${{ env.SUBDOMAINS_FOUND }}\n\n\`\`\`\n$SUBDOMAINS_CONTENT\n\`\`\`"
+          
+          if [ ${#MESSAGE} -gt 1900 ]; then
+            TRUNCATED=$(echo "$SUBDOMAINS_CONTENT" | head -c 1800)
+            MESSAGE="✅ **Subdomain Enumeration Complete**\n**Domain:** ${{ env.DOMAIN }}\n**Subdomains Found:** ${{ env.SUBDOMAINS_FOUND }}\n\n\`\`\`\n$TRUNCATED... [truncated]\n\`\`\`"
+          fi
+          
+          curl -X POST -H "Content-Type: application/json" \
+            -d "{\"content\": $(echo "$MESSAGE" | jq -Rs .)}" \
+            "${{ env.DISCORD_WEBHOOK }}"
+
+      - name: Run Vulnerability Scanners
+        run: |
+          # 1. Nuclei
+          echo "[*] Running Nuclei..."
+          nuclei -l subdomains.txt -severity critical,high,medium -silent -o nuclei-results.txt
+          
+          # 2. Subzy
+          echo "[*] Running Subzy..."
+          subzy run --targets subdomains.txt --output subzy-results.txt --https --hide_fails
+          
+          # Combine all vulnerability results
+          cat nuclei-results.txt subzy-results.txt > vulnerabilities.txt
+          echo "VULNS_FOUND=$(wc -l < vulnerabilities.txt)" >> $GITHUB_ENV
+          echo "[+] Total vulnerabilities found: ${{ env.VULNS_FOUND }}"
+
+      - name: Notify Vulnerability Summary
+        run: |
+          if [ ${{ env.VULNS_FOUND }} -gt 0 ]; then
+            curl -X POST -H "Content-Type: application/json" -d '{
+              "content": "🚨 **Vulnerabilities Found!**\n**Domain:** ${{ env.DOMAIN }}\n**Count:** ${{ env.VULNS_FOUND }}\n\nSending each vulnerability as a separate message..."
+            }' "${{ env.DISCORD_WEBHOOK }}"
+          else
+            curl -X POST -H "Content-Type: application/json" -d '{
+              "content": "✅ **Vulnerability Scan Complete**\n**Domain:** ${{ env.DOMAIN }}\nNo critical/high/medium vulnerabilities found."
+            }' "${{ env.DISCORD_WEBHOOK }}"
+          fi
+
+      - name: Send Individual Vulnerabilities
+        if: env.VULNS_FOUND > 0
+        run: |
+          while IFS= read -r vuln; do
+            if [ -n "$vuln" ]; then
+              MESSAGE="🚨 **Vulnerability Found**\n**Domain:** ${{ env.DOMAIN }}\n\`\`\`\n$vuln\n\`\`\`"
+              curl -X POST -H "Content-Type: application/json" \
+                -d "{\"content\": $(echo "$MESSAGE" | jq -Rs .)}" \
+                "${{ env.DISCORD_WEBHOOK }}"
+              sleep 1
+            fi
+          done < vulnerabilities.txt
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results-${{ env.DOMAIN }}
+          path: |
+            subdomains.txt
+            nuclei-results.txt
+            subzy-results.txt
+            vulnerabilities.txt
+            enum_results/
