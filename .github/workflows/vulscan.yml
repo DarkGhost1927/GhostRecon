@@ -1,4 +1,4 @@
-name: Ghost Subdomain & Vulnerability Scanner
+name: Subdomain & Vulnerability Scanner
 
 on:
   workflow_dispatch:
@@ -26,35 +26,55 @@ jobs:
         run: |
           set -e
 
-          # update & base packages
+          # base packages
           sudo apt-get update
           sudo apt-get install -y jq unzip wget git build-essential ca-certificates
 
-          # ensure Go bin in PATH (actions/setup-go must run before this)
+          # ensure go binaries path is available to later steps
+          echo "GOBIN=$HOME/go/bin" >> $GITHUB_ENV
           echo "PATH=$PATH:$HOME/go/bin" >> $GITHUB_ENV
+          export GOBIN=$HOME/go/bin
           export PATH=$PATH:$HOME/go/bin
 
-          # Install via go (will put binaries in $HOME/go/bin)
-          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-          go install -v github.com/tomnomnom/assetfinder@latest
-          # Subzy: use maintained fork (works with `go install`)
-          go install -v github.com/PentestPad/subzy@latest
+          # recommended go env
+          export CGO_ENABLED=0
+          export GOFLAGS="-mod=mod"
 
-          # Install Amass (binary release)
+          # Install subfinder, nuclei, assetfinder
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest || true
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest || true
+          go install -v github.com/tomnomnom/assetfinder@latest || true
+
+          # Install Subzy: try go install from cmd, fallback to clone+build
+          if ! go install -v github.com/lukasikic/subzy/cmd/subzy@latest; then
+            echo "go install for subzy failed, trying clone+build..."
+            git clone https://github.com/lukasikic/subzy.git /tmp/subzy || { echo "git clone subzy failed"; }
+            if [ -d /tmp/subzy ]; then
+              cd /tmp/subzy
+              go build -v -o "$GOBIN/subzy" ./cmd/subzy || echo "go build subzy failed"
+              cd -
+              rm -rf /tmp/subzy
+            fi
+          fi
+
+          # Install Amass from releases (don't use apt)
           wget -q https://github.com/OWASP/Amass/releases/latest/download/amass_linux_amd64.zip
-          unzip -q amass_linux_amd64.zip
-          sudo mv amass_linux_amd64/amass /usr/local/bin/
-          sudo chmod +x /usr/local/bin/amass
-          rm -rf amass_linux_amd64* amass_linux_amd64.zip
+          if [ -f amass_linux_amd64.zip ]; then
+            unzip -q amass_linux_amd64.zip
+            sudo mv amass_linux_amd64/amass /usr/local/bin/ || true
+            sudo chmod +x /usr/local/bin/amass || true
+            rm -rf amass_linux_amd64* amass_linux_amd64.zip
+          else
+            echo "amass zip not downloaded; continuing without amass binary"
+          fi
 
-          # small verification (non-failing if a tool absent)
-          echo "---- installed tools (versions / help snippets) ----"
-          subfinder -version || subfinder -h | head -n 1 || true
-          nuclei -version || nuclei -h | head -n 1 || true
-          assetfinder -h | head -n 1 || true
-          subzy -h | head -n 1 || true
-          amass -version || true
+          # Verify availability (non-fatal)
+          echo "---- versions / availability ----"
+          subfinder -version 2>/dev/null || subfinder -h 2>/dev/null || true
+          nuclei -version 2>/dev/null || nuclei -h 2>/dev/null || true
+          assetfinder -h 2>/dev/null || true
+          subzy -h 2>/dev/null || true
+          amass -version 2>/dev/null || true
 
       - name: Validate Secrets
         run: |
@@ -75,119 +95,109 @@ jobs:
 
       - name: Notify Start
         run: |
-          curl -X POST -H "Content-Type: application/json" -d '{
+          curl -s -X POST -H "Content-Type: application/json" -d '{
             "content": "🔍 **Scan Started**\n**Domain:** ${{ env.DOMAIN }}\n**Trigger:** ${{ github.event_name }}\n**Tools:** Subfinder + Assetfinder + Amass + Nuclei + Subzy"
-          }' "${{ env.DISCORD_WEBHOOK }}"
+          }' "${{ env.DISCORD_WEBHOOK }}" || true
 
       - name: Run Subfinder
         run: |
-          subfinder -d ${{ env.DOMAIN }} -silent -o subfinder-subs.txt
+          subfinder -d ${{ env.DOMAIN }} -silent -o subfinder-subs.txt || true
+          [ -f subfinder-subs.txt ] || touch subfinder-subs.txt
           echo "SUBFINDER_SUBS_FOUND=$(wc -l < subfinder-subs.txt)" >> $GITHUB_ENV
 
       - name: Run Assetfinder
         run: |
-          assetfinder -subs-only ${{ env.DOMAIN }} > assetfinder-subs.txt
+          assetfinder -subs-only ${{ env.DOMAIN }} > assetfinder-subs.txt || true
+          [ -f assetfinder-subs.txt ] || touch assetfinder-subs.txt
           echo "ASSETFINDER_SUBS_FOUND=$(wc -l < assetfinder-subs.txt)" >> $GITHUB_ENV
 
       - name: Run Amass
         run: |
-          amass enum -d ${{ env.DOMAIN }} -o amass-subs.txt
+          if command -v amass >/dev/null 2>&1; then
+            amass enum -d ${{ env.DOMAIN }} -o amass-subs.txt || true
+          else
+            echo "amass not available; creating empty file" > amass-subs.txt
+          fi
+          [ -f amass-subs.txt ] || touch amass-subs.txt
           echo "AMASS_SUBS_FOUND=$(wc -l < amass-subs.txt)" >> $GITHUB_ENV
 
       - name: Combine All Subdomains
         run: |
           cat subfinder-subs.txt assetfinder-subs.txt amass-subs.txt | sort -u > subdomains.txt
+          [ -f subdomains.txt ] || touch subdomains.txt
           echo "TOTAL_SUBDOMAINS_FOUND=$(wc -l < subdomains.txt)" >> $GITHUB_ENV
 
       - name: Notify Subdomain Results
         run: |
-          # Read subdomains content
           SUBDOMAINS_CONTENT=$(cat subdomains.txt)
-          
-          # Create message
           MESSAGE="✅ **Subdomain Discovery Complete**\n**Domain:** ${{ env.DOMAIN }}\n**Subfinder Subdomains:** ${{ env.SUBFINDER_SUBS_FOUND }}\n**Assetfinder Subdomains:** ${{ env.ASSETFINDER_SUBS_FOUND }}\n**Amass Subdomains:** ${{ env.AMASS_SUBS_FOUND }}\n**Total Unique Subdomains:** ${{ env.TOTAL_SUBDOMAINS_FOUND }}\n\n\`\`\`\n$SUBDOMAINS_CONTENT\n\`\`\`"
-          
-          # Truncate if too long
           if [ ${#MESSAGE} -gt 1900 ]; then
             TRUNCATED=$(echo "$SUBDOMAINS_CONTENT" | head -c 1800)
             MESSAGE="✅ **Subdomain Discovery Complete**\n**Domain:** ${{ env.DOMAIN }}\n**Subfinder Subdomains:** ${{ env.SUBFINDER_SUBS_FOUND }}\n**Assetfinder Subdomains:** ${{ env.ASSETFINDER_SUBS_FOUND }}\n**Amass Subdomains:** ${{ env.AMASS_SUBS_FOUND }}\n**Total Unique Subdomains:** ${{ env.TOTAL_SUBDOMAINS_FOUND }}\n\n\`\`\`\n$TRUNCATED... [truncated]\n\`\`\`"
           fi
-          
-          # Send to Discord
-          curl -X POST -H "Content-Type: application/json" \
+          curl -s -X POST -H "Content-Type: application/json" \
             -d "{\"content\": $(echo "$MESSAGE" | jq -Rs .)}" \
-            "${{ env.DISCORD_WEBHOOK }}"
+            "${{ env.DISCORD_WEBHOOK }}" || true
 
       - name: Run Nuclei
         run: |
-          nuclei -l subdomains.txt -severity critical,high,medium -silent -o nuclei-results.txt
+          nuclei -l subdomains.txt -severity critical,high,medium -silent -o nuclei-results.txt || true
+          [ -f nuclei-results.txt ] || touch nuclei-results.txt
           echo "NUCLEI_VULNS_FOUND=$(wc -l < nuclei-results.txt)" >> $GITHUB_ENV
 
       - name: Run Subzy
         run: |
-          subzy run --targets subdomains.txt --hide_fails --output subzy-results.txt
+          # try subzy (if available)
+          if command -v subzy >/dev/null 2>&1; then
+            subzy run --targets subdomains.txt --hide_fails --output subzy-results.txt || true
+          else
+            echo "subzy not available; creating empty file" > subzy-results.txt
+          fi
+          [ -f subzy-results.txt ] || touch subzy-results.txt
           echo "SUBZY_VULNS_FOUND=$(wc -l < subzy-results.txt)" >> $GITHUB_ENV
 
       - name: Notify Vulnerability Summary
         run: |
-          TOTAL_VULNS=$((${{ env.NUCLEI_VULNS_FOUND }} + ${{ env.SUBZY_VULNS_FOUND }}))
+          NUCLEI_VULNS_FOUND=${NUCLEI_VULNS_FOUND:-0}
+          SUBZY_VULNS_FOUND=${SUBZY_VULNS_FOUND:-0}
+          TOTAL_VULNS=$(( NUCLEI_VULNS_FOUND + SUBZY_VULNS_FOUND ))
           echo "TOTAL_VULNS_FOUND=$TOTAL_VULNS" >> $GITHUB_ENV
-          
-          if [ $TOTAL_VULNS -gt 0 ]; then
-            curl -X POST -H "Content-Type: application/json" -d "{
-              \"content\": \"🚨 **Vulnerabilities Found!**\n**Domain:** ${{ env.DOMAIN }}\n**Nuclei Vulnerabilities:** ${{ env.NUCLEI_VULNS_FOUND }}\n**Subzy Vulnerabilities:** ${{ env.SUBZY_VULNS_FOUND }}\n**Total:** $TOTAL_VULNS\n\nSending each vulnerability as a separate message...\"
-            }" "${{ env.DISCORD_WEBHOOK }}"
+
+          if [ "$TOTAL_VULNS" -gt 0 ]; then
+            curl -s -X POST -H "Content-Type: application/json" -d "{
+              \"content\": \"🚨 **Vulnerabilities Found!**\n**Domain:** ${{ env.DOMAIN }}\n**Nuclei Vulnerabilities:** $NUCLEI_VULNS_FOUND\n**Subzy Vulnerabilities:** $SUBZY_VULNS_FOUND\n**Total:** $TOTAL_VULNS\n\nSending each vulnerability as a separate message...\"
+            }" "${{ env.DISCORD_WEBHOOK }}" || true
           else
-            curl -X POST -H "Content-Type: application/json" -d '{
+            curl -s -X POST -H "Content-Type: application/json" -d '{
               "content": "✅ **Scan Complete**\n**Domain:** ${{ env.DOMAIN }}\nNo critical/high/medium vulnerabilities found"
-            }' "${{ env.DISCORD_WEBHOOK }}"
+            }' "${{ env.DISCORD_WEBHOOK }}" || true
           fi
 
       - name: Send Nuclei Vulnerabilities
-        if: env.NUCLEI_VULNS_FOUND > 0
+        if: ${{ env.NUCLEI_VULNS_FOUND != '0' }}
         run: |
-          # Read each line and send as separate message
           while IFS= read -r vuln; do
-            # Extract vulnerability details from nuclei output
-            VULN_NAME=$(echo "$vuln" | grep -oP '\[\K[^\]]+' | head -1)
-            SEVERITY=$(echo "$vuln" | grep -oP '\]\[\K[^\]]+' | head -1)
-            URL=$(echo "$vuln" | grep -oP 'http[^\s]+' | head -1)
-            
-            # Set default values if extraction fails
-            if [ -z "$VULN_NAME" ]; then VULN_NAME="Unknown"; fi
-            if [ -z "$SEVERITY" ]; then SEVERITY="Unknown"; fi
-            
-            # Create message for this vulnerability
+            VULN_NAME=$(echo "$vuln" | grep -oP '\[\K[^\]]+' | head -1 || echo "Unknown")
+            SEVERITY=$(echo "$vuln" | grep -oP '\]\[\K[^\]]+' | head -1 || echo "Unknown")
+            URL=$(echo "$vuln" | grep -oP 'http[^\s]+' | head -1 || echo "")
             MESSAGE="🚨 **Nuclei Vulnerability Found**\n**Domain:** ${{ env.DOMAIN }}\n**URL:** $URL\n**Vulnerability:** $VULN_NAME\n**Severity:** $SEVERITY\n\`\`\`\n$vuln\n\`\`\`"
-            
-            # Send to Discord
-            curl -X POST -H "Content-Type: application/json" \
+            curl -s -X POST -H "Content-Type: application/json" \
               -d "{\"content\": $(echo "$MESSAGE" | jq -Rs .)}" \
-              "${{ env.DISCORD_WEBHOOK }}"
-              
-            # Small delay to avoid rate limiting
+              "${{ env.DISCORD_WEBHOOK }}" || true
             sleep 1
           done < nuclei-results.txt
 
       - name: Send Subzy Vulnerabilities
-        if: env.SUBZY_VULNS_FOUND > 0
+        if: ${{ env.SUBZY_VULNS_FOUND != '0' }}
         run: |
-          # Read each line and send as separate message
           while IFS= read -r vuln; do
-            # Extract subdomain from subzy output
-            SUBDOMAIN=$(echo "$vuln" | awk '{print $1}')
+            SUBDOMAIN=$(echo "$vuln" | awk '{print $1}' || echo "")
             VULN_NAME="Subdomain Takeover"
             SEVERITY="High"
-            
-            # Create message for this vulnerability
             MESSAGE="🚨 **Subzy Vulnerability Found**\n**Domain:** ${{ env.DOMAIN }}\n**Subdomain:** $SUBDOMAIN\n**Vulnerability:** $VULN_NAME\n**Severity:** $SEVERITY\n\`\`\`\n$vuln\n\`\`\`"
-            
-            # Send to Discord
-            curl -X POST -H "Content-Type: application/json" \
+            curl -s -X POST -H "Content-Type: application/json" \
               -d "{\"content\": $(echo "$MESSAGE" | jq -Rs .)}" \
-              "${{ env.DISCORD_WEBHOOK }}"
-              
-            # Small delay to avoid rate limiting
+              "${{ env.DISCORD_WEBHOOK }}" || true
             sleep 1
           done < subzy-results.txt
 
