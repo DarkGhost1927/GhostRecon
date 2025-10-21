@@ -1,59 +1,68 @@
-name: Subdomain & Vulnerability Scanner
+name: Subdomain & Vulnerability Scanner (Final)
 
 on:
   workflow_dispatch:
     inputs:
       domain:
-        description: 'Domain(s) to scan (space-separated)'
+        description: 'Leave default to use secret, or enter new domains here (space-separated)'
         required: true
-        # القيمة الافتراضية الآن تأتي من السيكرت
-        default: ${{ secrets.TARGET_DOMAIN }}
+        # A static, safe default value to avoid parsing errors.
+        default: 'Use targets from secret'
   schedule:
     # Every Monday at 6 AM UTC
     - cron: '0 6 * * 1'
 
 jobs:
-  # This job prepares the list of domains for the matrix
   setup:
     runs-on: ubuntu-latest
     outputs:
-      # We will output a JSON array of domains
       domains: ${{ steps.set-domains.outputs.domains }}
     steps:
       - name: Prepare Domain List
         id: set-domains
         run: |
+          # This is the placeholder text from the 'default' input
+          PLACEHOLDER='Use targets from secret'
+
+          # Logic to decide which domain list to use
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            # For manual runs, use the input
-            domains_string="${{ github.event.inputs.domain }}"
+            # For manual runs, check if the user changed the default placeholder
+            if [ "${{ github.event.inputs.domain }}" != "$PLACEHOLDER" ]; then
+              # If they changed it, use their new input
+              domains_string="${{ github.event.inputs.domain }}"
+              echo "Using user-provided domains from manual trigger."
+            else
+              # If they left the placeholder, fall back to the secret
+              domains_string="${{ secrets.TARGET_DOMAIN }}"
+              echo "User left default value, falling back to TARGET_DOMAIN secret."
+            fi
           else
-            # For scheduled runs, use the repository secret
+            # For scheduled runs, always use the secret
             domains_string="${{ secrets.TARGET_DOMAIN }}"
+            echo "Using TARGET_DOMAIN secret for scheduled run."
           fi
 
-          # Add a check to ensure the secret/input is not empty
+          # Final check to ensure we have a non-empty domain string
           if [ -z "$domains_string" ]; then
-            echo "::error::Secret TARGET_DOMAIN is not set or is empty."
+            echo "::error::Domain list is empty. Check your input or the TARGET_DOMAIN secret."
             exit 1
           fi
 
           # Convert the space-separated string into a JSON array for the matrix
           json_array=$(echo "$domains_string" | jq -R 'split(" ")' | jq -c .)
+          echo "Final JSON for matrix: $json_array"
           echo "domains=$json_array" >> $GITHUB_OUTPUT
 
-  # This job will run for EACH domain in the list prepared by the 'setup' job
   scan:
-    # It needs the 'setup' job to finish first
     needs: setup
     runs-on: ubuntu-latest
-    # This is the matrix strategy
     strategy:
-      fail-fast: false # This ensures that if one domain scan fails, the others will continue
+      fail-fast: false
       matrix:
-        # 'domain' will be populated from the JSON array output of the 'setup' job
         domain: ${{ fromJson(needs.setup.outputs.domains) }}
 
     steps:
+      # ... (All other steps for installation, scanning, and notifications remain exactly the same) ...
       - name: Checkout Repository
         uses: actions/checkout@v4
 
@@ -86,17 +95,12 @@ jobs:
           curl -s -X POST -H "Content-Type: application/json" -d "{
             \"content\": \"🔍 **Scan Started for Domain:** `${{ matrix.domain }}`\n**Trigger:** `${{ github.event_name }}`\"
           }" "${{ env.DISCORD_WEBHOOK }}" || true
-      
-      # Renamed and combined the subdomain discovery steps for clarity
+
       - name: Run Subdomain Discovery for ${{ matrix.domain }}
         run: |
-          # Use the domain from the matrix
           subfinder -d ${{ matrix.domain }} -silent -o subfinder-subs.txt || true
           assetfinder --subs-only ${{ matrix.domain }} > assetfinder-subs.txt || true
-          
-          # Combine results for this specific domain
           cat subfinder-subs.txt assetfinder-subs.txt | sort -u > subdomains.txt
-          
           echo "SUBFINDER_SUBS_FOUND=$(wc -l < subfinder-subs.txt)" >> $GITHUB_ENV
           echo "ASSETFINDER_SUBS_FOUND=$(wc -l < assetfinder-subs.txt)" >> $GITHUB_ENV
           echo "TOTAL_SUBDOMAINS_FOUND=$(wc -l < subdomains.txt)" >> $GITHUB_ENV
@@ -105,9 +109,8 @@ jobs:
         run: |
           SUBDOMAINS_CONTENT=$(head -n 20 subdomains.txt)
           MESSAGE="✅ **Subdomain Discovery Complete**\n**Domain:** ${{ matrix.domain }}\n**Subfinder:** ${{ env.SUBFINDER_SUBS_FOUND }}\n**Assetfinder:** ${{ env.ASSETFINDER_SUBS_FOUND }}\n**Total Unique:** ${{ env.TOTAL_SUBDOMAINS_FOUND }}\n\n**Sample Results:**\n\`\`\`\n$SUBDOMAINS_CONTENT\n\`\`\`"
-          # Logic for truncating the message if it's too long for Discord
           if [ ${#MESSAGE} -gt 1950 ]; then
-            MESSAGE="✅ **Subdomain Discovery Complete**\n**Domain:** ${{ matrix.domain }}\n**Total Unique:** ${{ env.TOTAL_SUBDOMAINS_FOUND }}\n(Result list truncated as it exceeds Discord's limit)"
+            MESSAGE="✅ **Subdomain Discovery Complete**\n**Domain:** ${{ matrix.domain }}\n**Total Unique:** ${{ env.TOTAL_SUBDOMAINS_FOUND }}\n(Result list truncated)"
           fi
           curl -s -X POST -H "Content-Type: application/json" -d "{\"content\": $(echo "$MESSAGE" | jq -Rs .)}" "${{ env.DISCORD_WEBHOOK }}" || true
 
@@ -142,4 +145,3 @@ jobs:
           path: |
             subdomains.txt
             nuclei-results.txt
-
