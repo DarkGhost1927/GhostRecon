@@ -6,7 +6,8 @@ on:
       domain:
         description: 'Domain(s) to scan (space-separated)'
         required: true
-        default: ${{ vars.TARGET_DOMAIN }}
+        # القيمة الافتراضية الآن تأتي من السيكرت
+        default: ${{ secrets.TARGET_DOMAIN }}
   schedule:
     # Every Monday at 6 AM UTC
     - cron: '0 6 * * 1'
@@ -26,9 +27,16 @@ jobs:
             # For manual runs, use the input
             domains_string="${{ github.event.inputs.domain }}"
           else
-            # For scheduled runs, use the repository variable
-            domains_string="${{ vars.TARGET_DOMAIN }}"
+            # For scheduled runs, use the repository secret
+            domains_string="${{ secrets.TARGET_DOMAIN }}"
           fi
+
+          # Add a check to ensure the secret/input is not empty
+          if [ -z "$domains_string" ]; then
+            echo "::error::Secret TARGET_DOMAIN is not set or is empty."
+            exit 1
+          fi
+
           # Convert the space-separated string into a JSON array for the matrix
           json_array=$(echo "$domains_string" | jq -R 'split(" ")' | jq -c .)
           echo "domains=$json_array" >> $GITHUB_OUTPUT
@@ -56,21 +64,16 @@ jobs:
 
       - name: Install Tools
         run: |
-          # (Installation steps remain the same)
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y jq unzip wget git build-essential ca-certificates
           echo "GOBIN=$HOME/go/bin" >> $GITHUB_ENV
           echo "PATH=$PATH:$HOME/go/bin" >> $GITHUB_ENV
-          export GOBIN=$HOME/go/bin
-          export PATH=$PATH:$HOME/go/bin
-          export CGO_ENABLED=0
-          export GOFLAGS="-mod=mod"
           go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest || true
           go install -v github.com/tomnomnom/assetfinder@latest || true
           go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest || true
 
-      - name: Validate Secrets
+      - name: Validate Discord Secret
         run: |
           if [ -z "${{ secrets.DISCORD_GHOST }}" ]; then
             echo "::error::DISCORD_GHOST secret is not set."
@@ -80,15 +83,16 @@ jobs:
 
       - name: Notify Start for ${{ matrix.domain }}
         run: |
-          curl -s -X POST -H "Content-Type: application/json" -d '{
-            "content": "🔍 **Scan Started for Domain:** `${{ matrix.domain }}`\n**Trigger:** `${{ github.event_name }}`"
-          }' "${{ env.DISCORD_WEBHOOK }}" || true
-
-      - name: Run Subfinder & Assetfinder for ${{ matrix.domain }}
+          curl -s -X POST -H "Content-Type: application/json" -d "{
+            \"content\": \"🔍 **Scan Started for Domain:** `${{ matrix.domain }}`\n**Trigger:** `${{ github.event_name }}`\"
+          }" "${{ env.DISCORD_WEBHOOK }}" || true
+      
+      # Renamed and combined the subdomain discovery steps for clarity
+      - name: Run Subdomain Discovery for ${{ matrix.domain }}
         run: |
           # Use the domain from the matrix
           subfinder -d ${{ matrix.domain }} -silent -o subfinder-subs.txt || true
-          assetfinder -subs-only ${{ matrix.domain }} > assetfinder-subs.txt || true
+          assetfinder --subs-only ${{ matrix.domain }} > assetfinder-subs.txt || true
           
           # Combine results for this specific domain
           cat subfinder-subs.txt assetfinder-subs.txt | sort -u > subdomains.txt
@@ -97,16 +101,13 @@ jobs:
           echo "ASSETFINDER_SUBS_FOUND=$(wc -l < assetfinder-subs.txt)" >> $GITHUB_ENV
           echo "TOTAL_SUBDOMAINS_FOUND=$(wc -l < subdomains.txt)" >> $GITHUB_ENV
 
-      # Notification steps now use ${{ matrix.domain }}
       - name: Notify Subdomain Results for ${{ matrix.domain }}
         run: |
-          # (This step is slightly modified to refer to the matrix domain)
-          SUBDOMAINS_CONTENT=$(cat subdomains.txt)
-          MESSAGE="✅ **Subdomain Discovery Complete**\n**Domain:** ${{ matrix.domain }}\n**Subfinder:** ${{ env.SUBFINDER_SUBS_FOUND }}\n**Assetfinder:** ${{ env.ASSETFINDER_SUBS_FOUND }}\n**Total Unique:** ${{ env.TOTAL_SUBDOMAINS_FOUND }}\n\n\`\`\`\n$SUBDOMAINS_CONTENT\n\`\`\`"
-          # (Logic for truncating message remains the same)
-          if [ ${#MESSAGE} -gt 1900 ]; then
-            TRUNCATED=$(echo "$SUBDOMAINS_CONTENT" | head -c 1800)
-            MESSAGE="✅ **Subdomain Discovery Complete**\n**Domain:** ${{ matrix.domain }}\n... (truncated)"
+          SUBDOMAINS_CONTENT=$(head -n 20 subdomains.txt)
+          MESSAGE="✅ **Subdomain Discovery Complete**\n**Domain:** ${{ matrix.domain }}\n**Subfinder:** ${{ env.SUBFINDER_SUBS_FOUND }}\n**Assetfinder:** ${{ env.ASSETFINDER_SUBS_FOUND }}\n**Total Unique:** ${{ env.TOTAL_SUBDOMAINS_FOUND }}\n\n**Sample Results:**\n\`\`\`\n$SUBDOMAINS_CONTENT\n\`\`\`"
+          # Logic for truncating the message if it's too long for Discord
+          if [ ${#MESSAGE} -gt 1950 ]; then
+            MESSAGE="✅ **Subdomain Discovery Complete**\n**Domain:** ${{ matrix.domain }}\n**Total Unique:** ${{ env.TOTAL_SUBDOMAINS_FOUND }}\n(Result list truncated as it exceeds Discord's limit)"
           fi
           curl -s -X POST -H "Content-Type: application/json" -d "{\"content\": $(echo "$MESSAGE" | jq -Rs .)}" "${{ env.DISCORD_WEBHOOK }}" || true
 
@@ -116,11 +117,18 @@ jobs:
           [ -f nuclei-results.txt ] || touch nuclei-results.txt
           echo "NUCLEI_VULNS_FOUND=$(wc -l < nuclei-results.txt)" >> $GITHUB_ENV
 
-      # (Other notification steps will also use ${{ matrix.domain }})
+      - name: Notify Vulnerability Summary for ${{ matrix.domain }}
+        run: |
+          if [ "${{ env.NUCLEI_VULNS_FOUND }}" -gt 0 ]; then
+             MESSAGE="🚨 **Vulnerabilities Found!**\n**Domain:** ${{ matrix.domain }}\n**Total:** ${{ env.NUCLEI_VULNS_FOUND }}\n\nSending details..."
+          else
+             MESSAGE="✅ **Vulnerability Scan Complete**\n**Domain:** ${{ matrix.domain }}\nNo critical/high/medium vulnerabilities found."
+          fi
+          curl -s -X POST -H "Content-Type: application/json" -d "{\"content\": \"$MESSAGE\"}" "${{ env.DISCORD_WEBHOOK }}" || true
+
       - name: Send Nuclei Vulnerabilities for ${{ matrix.domain }}
         if: env.NUCLEI_VULNS_FOUND != '0'
         run: |
-          # This logic now sends vulnerabilities found for the specific domain in this job run
           while IFS= read -r vuln; do
              MESSAGE="🚨 **Nuclei Vulnerability Found**\n**Domain:** ${{ matrix.domain }}\n\`\`\`\n$vuln\n\`\`\`"
              curl -s -X POST -H "Content-Type: application/json" -d "{\"content\": $(echo "$MESSAGE" | jq -Rs .)}" "${{ env.DISCORD_WEBHOOK }}" || true
@@ -130,8 +138,8 @@ jobs:
       - name: Upload Artifacts for ${{ matrix.domain }}
         uses: actions/upload-artifact@v4
         with:
-          # Create a uniquely named artifact for each domain's results
           name: scan-results-${{ matrix.domain }}
           path: |
             subdomains.txt
             nuclei-results.txt
+
