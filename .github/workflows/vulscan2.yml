@@ -1,149 +1,124 @@
-name: Subdomain & Vulnerability Scanner 2
+name: DOMAIN SCANNER
 
 on:
   workflow_dispatch:
     inputs:
       domain:
-        description: 'Domain to scan'
+        description: 'اترك القيمة الافتراضية لاستخدام السيكرت، أو أدخل دومينات جديدة هنا (مفصولة بمسافة)'
         required: true
-        default: 'example.com'
+        # قيمة افتراضية ثابتة وآمنة لتجنب أخطاء التحليل
+        default: 'استخدم الأهداف من السيكرت'
   schedule:
-    - cron: '0 6 * * 1'  # Every Monday at 6 AM UTC
+    # كل يوم اثنين الساعة 6 صباحًا بتوقيت UTC
+    - cron: '0 6 * * 1'
 
 jobs:
-  scan:
+  setup:
     runs-on: ubuntu-latest
+    outputs:
+      domains: ${{ steps.set-domains.outputs.domains }}
     steps:
-      - name: Checkout Repository
+      - name: تجهيز قائمة الدومينات
+        id: set-domains
+        run: |
+          # هذا هو النص البديل من حقل الإدخال "الافتراضي"
+          PLACEHOLDER='استخدم الأهداف من السيكرت'
+
+          # منطق لتحديد قائمة الدومينات التي سيتم استخدامها
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # للتشغيل اليدوي، تحقق مما إذا قام المستخدم بتغيير النص البديل
+            if [ "${{ github.event.inputs.domain }}" != "$PLACEHOLDER" ]; then
+              # إذا قام بتغييره، استخدم مدخلاته الجديدة
+              domains_string="${{ github.event.inputs.domain }}"
+              echo "استخدام الدومينات التي أدخلها المستخدم."
+            else
+              # إذا ترك النص البديل، ارجع إلى السيكرت
+              domains_string="${{ secrets.SCAN_TARGETS }}"
+              echo "تم ترك القيمة الافتراضية، سيتم استخدام السيكرت SCAN_TARGETS."
+            fi
+          else
+            # للتشغيل المجدول، استخدم السيكرت دائمًا
+            domains_string="${{ secrets.SCAN_TARGETS }}"
+            echo "استخدام السيكرت SCAN_TARGETS للتشغيل المجدول."
+          fi
+
+          # تحقق نهائي للتأكد من أن قائمة الدومينات ليست فارغة
+          if [ -z "$domains_string" ]; then
+            echo "::error::قائمة الدومينات فارغة. تحقق من مدخلاتك أو السيكرت SCAN_TARGETS."
+            exit 1
+          fi
+
+          # تحويل السلسلة النصية المفصولة بمسافات إلى مصفوفة JSON للماتريكس
+          json_array=$(echo "$domains_string" | jq -R 'split(" ")' | jq -c .)
+          echo "domains=$json_array" >> $GITHUB_OUTPUT
+
+  scan:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        domain: ${{ fromJson(needs.setup.outputs.domains) }}
+
+    steps:
+      - name: استنساخ الريبو
         uses: actions/checkout@v4
 
-      - name: Setup Go
+      - name: تثبيت Go
         uses: actions/setup-go@v4
         with:
           go-version: '1.21'
 
-      - name: Install Tools
+      - name: تثبيت Nuclei
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y jq unzip wget git build-essential ca-certificates
-
-          # ensure go bin in PATH for later steps
+          sudo apt-get install -y jq git
           echo "GOBIN=$HOME/go/bin" >> $GITHUB_ENV
           echo "PATH=$PATH:$HOME/go/bin" >> $GITHUB_ENV
-          export GOBIN=$HOME/go/bin
-          export PATH=$PATH:$HOME/go/bin
-
-          # recommended go env flags
-          export CGO_ENABLED=0
-          export GOFLAGS="-mod=mod"
-
-          # Install subfinder, assetfinder, nuclei
-          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest || true
-          go install -v github.com/tomnomnom/assetfinder@latest || true
           go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest || true
 
-          # quick availability check (non-fatal)
-          echo "Installed tools availability:"
-          which subfinder || true
-          which assetfinder || true
-          which nuclei || true
-
-      - name: Validate Secrets
+      - name: التحقق من سيكرت ديسكورد
         run: |
-          if [ -z "${{ secrets.DISCORD_WEBHOOK_URL }}" ]; then
-            echo "::error::DISCORD_WEBHOOK_URL secret is not set"
+          if [ -z "${{ secrets.DISCORD_GHOST2 }}" ]; then
+            echo "::error::السيكرت DISCORD_GHOST2 غير موجود."
             exit 1
           fi
-          echo "DISCORD_WEBHOOK_URL=${{ secrets.DISCORD_WEBHOOK_URL }}" >> $GITHUB_ENV
+          echo "DISCORD_WEBHOOK=${{ secrets.DISCORD_GHOST2 }}" >> $GITHUB_ENV
 
-      - name: Set Domain
-        id: set_domain
+      - name: إشعار بدء الفحص لـ ${{ matrix.domain }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "DOMAIN=${{ github.event.inputs.domain }}" >> $GITHUB_ENV
-          else
-            echo "DOMAIN=example.com" >> $GITHUB_ENV
-          fi
+          curl -s -X POST -H "Content-Type: application/json" -d "{
+            \"content\": \"🔍 **بدء فحص الثغرات المباشر**\n**الدومين:** `${{ matrix.domain }}`\n**نوع التشغيل:** `${{ github.event_name }}`\"
+          }" "${{ env.DISCORD_WEBHOOK }}" || true
 
-      - name: Notify Start
+      - name: تشغيل فحص Nuclei على ${{ matrix.domain }}
         run: |
-          curl -s -X POST -H "Content-Type: application/json" -d '{
-            "content": "🔍 **Scan Started**\n**Domain:** ${{ env.DOMAIN }}\n**Trigger:** ${{ github.event_name }}\n**Tools:** Subfinder + Assetfinder + Nuclei"
-          }' "${{ env.DISCORD_WEBHOOK_URL }}" || true
-
-      - name: Run Subfinder
-        run: |
-          subfinder -d ${{ env.DOMAIN }} -silent -o subfinder-subs.txt || true
-          [ -f subfinder-subs.txt ] || touch subfinder-subs.txt
-          echo "SUBFINDER_SUBS_FOUND=$(wc -l < subfinder-subs.txt)" >> $GITHUB_ENV
-
-      - name: Run Assetfinder
-        run: |
-          assetfinder -subs-only ${{ env.DOMAIN }} > assetfinder-subs.txt || true
-          [ -f assetfinder-subs.txt ] || touch assetfinder-subs.txt
-          echo "ASSETFINDER_SUBS_FOUND=$(wc -l < assetfinder-subs.txt)" >> $GITHUB_ENV
-
-      - name: Combine All Subdomains
-        run: |
-          cat subfinder-subs.txt assetfinder-subs.txt | sort -u > subdomains.txt
-          [ -f subdomains.txt ] || touch subdomains.txt
-          echo "TOTAL_SUBDOMAINS_FOUND=$(wc -l < subdomains.txt)" >> $GITHUB_ENV
-
-      - name: Notify Subdomain Results
-        run: |
-          SUBDOMAINS_CONTENT=$(cat subdomains.txt)
-          MESSAGE="✅ **Subdomain Discovery Complete**\n**Domain:** ${{ env.DOMAIN }}\n**Subfinder Subdomains:** ${{ env.SUBFINDER_SUBS_FOUND }}\n**Assetfinder Subdomains:** ${{ env.ASSETFINDER_SUBS_FOUND }}\n**Total Unique Subdomains:** ${{ env.TOTAL_SUBDOMAINS_FOUND }}\n\n\`\`\`\n$SUBDOMAINS_CONTENT\n\`\`\`"
-          if [ ${#MESSAGE} -gt 1900 ]; then
-            TRUNCATED=$(echo "$SUBDOMAINS_CONTENT" | head -c 1800)
-            MESSAGE="✅ **Subdomain Discovery Complete**\n**Domain:** ${{ env.DOMAIN }}\n**Subfinder Subdomains:** ${{ env.SUBFINDER_SUBS_FOUND }}\n**Assetfinder Subdomains:** ${{ env.ASSETFINDER_SUBS_FOUND }}\n**Total Unique Subdomains:** ${{ env.TOTAL_SUBDOMAINS_FOUND }}\n\n\`\`\`\n$TRUNCATED... [truncated]\n\`\`\`"
-          fi
-          curl -s -X POST -H "Content-Type: application/json" \
-            -d "{\"content\": $(echo "$MESSAGE" | jq -Rs .)}" \
-            "${{ env.DISCORD_WEBHOOK_URL }}" || true
-
-      - name: Run Nuclei
-        run: |
-          nuclei -l subdomains.txt -severity critical,high,medium -silent -o nuclei-results.txt || true
+          nuclei -u ${{ matrix.domain }} -severity critical,high,medium -silent -o nuclei-results.txt || true
           [ -f nuclei-results.txt ] || touch nuclei-results.txt
           echo "NUCLEI_VULNS_FOUND=$(wc -l < nuclei-results.txt)" >> $GITHUB_ENV
 
-      - name: Notify Vulnerability Summary
+      - name: إشعار بملخص الثغرات لـ ${{ matrix.domain }}
         run: |
           NUCLEI_VULNS_FOUND=${NUCLEI_VULNS_FOUND:-0}
-          TOTAL_VULNS=$NUCLEI_VULNS_FOUND
-          echo "TOTAL_VULNS_FOUND=$TOTAL_VULNS" >> $GITHUB_ENV
-
-          if [ "$TOTAL_VULNS" -gt 0 ]; then
-            curl -s -X POST -H "Content-Type: application/json" -d "{
-              \"content\": \"🚨 **Vulnerabilities Found!**\n**Domain:** ${{ env.DOMAIN }}\n**Nuclei Vulnerabilities:** $NUCLEI_VULNS_FOUND\n**Total:** $TOTAL_VULNS\n\nSending each vulnerability as a separate message...\"
-            }" "${{ env.DISCORD_WEBHOOK_URL }}" || true
+          if [ "$NUCLEI_VULNS_FOUND" -gt 0 ]; then
+            MESSAGE="🚨 **تم العثور على ثغرات!**\n**الدومين:** ${{ matrix.domain }}\n**العدد الإجمالي:** $NUCLEI_VULNS_FOUND\n\nجاري إرسال التفاصيل..."
           else
-            curl -s -X POST -H "Content-Type: application/json" -d '{
-              "content": "✅ **Scan Complete**\n**Domain:** ${{ env.DOMAIN }}\nNo critical/high/medium vulnerabilities found"
-            }' "${{ env.DISCORD_WEBHOOK_URL }}" || true
+            MESSAGE="✅ **اكتمل الفحص**\n**الدومين:** ${{ matrix.domain }}\nلم يتم العثور على ثغرات."
           fi
+          curl -s -X POST -H "Content-Type: application/json" -d "{\"content\": \"$MESSAGE\"}" "${{ env.DISCORD_WEBHOOK }}" || true
 
-      - name: Send Nuclei Vulnerabilities
-        if: ${{ env.NUCLEI_VULNS_FOUND != '0' }}
+      - name: إرسال تفاصيل ثغرات Nuclei لـ ${{ matrix.domain }}
+        if: env.NUCLEI_VULNS_FOUND != '0'
         run: |
           while IFS= read -r vuln; do
-            VULN_NAME=$(echo "$vuln" | grep -oP '\[\K[^\]]+' | head -1 || echo "Unknown")
-            SEVERITY=$(echo "$vuln" | grep -oP '\]\[\K[^\]]+' | head -1 || echo "Unknown")
-            URL=$(echo "$vuln" | grep -oP 'http[^\s]+' | head -1 || echo "")
-            MESSAGE="🚨 **Nuclei Vulnerability Found**\n**Domain:** ${{ env.DOMAIN }}\n**URL:** $URL\n**Vulnerability:** $VULN_NAME\n**Severity:** $SEVERITY\n\`\`\`\n$vuln\n\`\`\`"
-            curl -s -X POST -H "Content-Type: application/json" \
-              -d "{\"content\": $(echo "$MESSAGE" | jq -Rs .)}" \
-              "${{ env.DISCORD_WEBHOOK_URL }}" || true
+            MESSAGE="🚨 **تفاصيل ثغرة**\n**الدومين:** ${{ matrix.domain }}\n\`\`\`\n$vuln\n\`\`\`"
+            curl -s -X POST -H "Content-Type: application/json" -d "{\"content\": $(echo "$MESSAGE" | jq -Rs .)}" "${{ env.DISCORD_WEBHOOK }}" || true
             sleep 1
           done < nuclei-results.txt
 
-      - name: Upload Artifacts
+      - name: رفع نتائج الفحص لـ ${{ matrix.domain }}
         uses: actions/upload-artifact@v4
         with:
-          name: scan-results
-          path: |
-            subfinder-subs.txt
-            assetfinder-subs.txt
-            subdomains.txt
-            nuclei-results.txt
+          name: nuclei-results-${{ matrix.domain }}
+          path: nuclei-results.txt
