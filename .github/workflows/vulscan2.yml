@@ -48,8 +48,13 @@ jobs:
             exit 1
           fi
 
-          # تحويل السلسلة النصية المفصولة بمسافات إلى مصفوفة JSON للماتريكس
-          json_array=$(echo "$domains_string" | jq -R 'split(" ")' | jq -c .)
+          #
+          # !!! THIS IS THE 1st MODIFIED LINE !!!
+          # (تحويل السلسلة النصية مع فلترة الفراغات)
+          json_array=$(echo "$domains_string" | jq -R 'split(" ") | map(select(. != ""))' | jq -c .)
+          #
+          #
+          
           echo "domains=$json_array" >> $GITHUB_OUTPUT
 
   scan:
@@ -98,17 +103,24 @@ jobs:
           [ -f nuclei-results.txt ] || touch nuclei-results.txt
           echo "NUCLEI_VULNS_FOUND=$(wc -l < nuclei-results.txt)" >> $GITHUB_ENV
 
+      #
+      # !!! THIS IS THE 2nd MODIFIED STEP !!!
+      # (تم تعديل الخطوة دي عشان تقرأ المتغير صح)
+      #
       - name: إشعار بملخص الثغرات لـ ${{ matrix.domain }}
         run: |
-          NUCLEI_VULNS_FOUND=${NUCLEI_VULNS_FOUND:-0}
-          if [ "$NUCLEI_VULNS_FOUND" -gt 0 ]; then
-            MESSAGE="🚨 **تم العثور على ثغرات!**\n**الدومين:** ${{ matrix.domain }}\n**العدد الإجمالي:** $NUCLEI_VULNS_FOUND\n\nجاري إرسال التفاصيل..."
+          # قراءة المتغير من الـ Environment الخاص بالـ Workflow
+          NUCLEI_VULNS_COUNT="${{ env.NUCLEI_VULNS_FOUND }}"
+          
+          if [ "$NUCLEI_VULNS_COUNT" -gt 0 ]; then
+            MESSAGE="🚨 **تم العثور على ثغرات!**\n**الدومين:** ${{ matrix.domain }}\n**العدد الإجمالي:** $NUCLEI_VULNS_COUNT\n\nجاري إرسال التفاصيل..."
           else
             MESSAGE="✅ **اكتمل الفحص**\n**الدومين:** ${{ matrix.domain }}\nلم يتم العثور على ثغرات."
           fi
           curl -s -X POST -H "Content-Type: application/json" -d "{\"content\": \"$MESSAGE\"}" "${{ env.DISCORD_WEBHOOK }}" || true
 
       - name: إرسال تفاصيل ثغرات Nuclei لـ ${{ matrix.domain }}
+        # الخطوة دي كانت سليمة وبتستخدم المتغير صح
         if: env.NUCLEI_VULNS_FOUND != '0'
         run: |
           while IFS= read -r vuln; do
